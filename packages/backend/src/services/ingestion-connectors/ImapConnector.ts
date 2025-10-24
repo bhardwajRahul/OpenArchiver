@@ -8,6 +8,7 @@ import type {
 import type { IEmailConnector } from '../EmailProviderFactory';
 import { ImapFlow } from 'imapflow';
 import { simpleParser, ParsedMail, Attachment, AddressObject, Headers } from 'mailparser';
+import { config } from '../../config';
 import { logger } from '../../config/logger';
 import { getThreadId } from './helpers/utils';
 
@@ -154,24 +155,18 @@ export class ImapConnector implements IEmailConnector {
 			const mailboxes = await this.withRetry(async () => await this.client.list());
 
 			const processableMailboxes = mailboxes.filter((mailbox) => {
-				// filter out trash and all mail emails
+				if (config.app.allInclusiveArchive) {
+					return true;
+				}
+				// filter out junk/spam mail emails
 				if (mailbox.specialUse) {
 					const specialUse = mailbox.specialUse.toLowerCase();
-					if (
-						specialUse === '\\junk' ||
-						specialUse === '\\trash' ||
-						specialUse === '\\all'
-					) {
+					if (specialUse === '\\junk' || specialUse === '\\trash') {
 						return false;
 					}
 				}
 				// Fallback to checking flags
-				if (
-					mailbox.flags.has('\\Noselect') ||
-					mailbox.flags.has('\\Trash') ||
-					mailbox.flags.has('\\Junk') ||
-					mailbox.flags.has('\\All')
-				) {
+				if (mailbox.flags.has('\\Trash') || mailbox.flags.has('\\Junk')) {
 					return false;
 				}
 

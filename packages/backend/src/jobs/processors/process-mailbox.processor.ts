@@ -13,7 +13,7 @@ import { IndexingService } from '../../services/IndexingService';
 import { SearchService } from '../../services/SearchService';
 import { DatabaseService } from '../../services/DatabaseService';
 import { config } from '../../config';
-
+import { indexingQueue } from '../queues';
 
 /**
  * This processor handles the ingestion of emails for a single user's mailbox.
@@ -55,7 +55,7 @@ export const processMailboxProcessor = async (job: Job<IProcessMailboxJob, SyncS
 				if (processedEmail) {
 					emailBatch.push(processedEmail);
 					if (emailBatch.length >= BATCH_SIZE) {
-						await indexingService.indexEmailBatch(emailBatch);
+						await indexingQueue.add('index-email-batch', { emails: emailBatch });
 						emailBatch = [];
 					}
 				}
@@ -63,7 +63,7 @@ export const processMailboxProcessor = async (job: Job<IProcessMailboxJob, SyncS
 		}
 
 		if (emailBatch.length > 0) {
-			await indexingService.indexEmailBatch(emailBatch);
+			await indexingQueue.add('index-email-batch', { emails: emailBatch });
 			emailBatch = [];
 		}
 

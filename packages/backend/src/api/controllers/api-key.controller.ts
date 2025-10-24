@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { ApiKeyService } from '../../services/ApiKeyService';
 import { z } from 'zod';
-import { config } from '../../config';
+import { UserService } from '../../services/UserService';
 
 const generateApiKeySchema = z.object({
 	name: z
@@ -14,20 +14,27 @@ const generateApiKeySchema = z.object({
 		.positive('Only positive number is allowed')
 		.max(730, 'The API key must expire within 2 years / 730 days.'),
 });
-
 export class ApiKeyController {
+	private userService = new UserService();
 	public async generateApiKey(req: Request, res: Response) {
-		if (config.app.isDemo) {
-			return res.status(403).json({ message: req.t('errors.demoMode') });
-		}
 		try {
 			const { name, expiresInDays } = generateApiKeySchema.parse(req.body);
 			if (!req.user || !req.user.sub) {
 				return res.status(401).json({ message: 'Unauthorized' });
 			}
 			const userId = req.user.sub;
+			const actor = await this.userService.findById(userId);
+			if (!actor) {
+				return res.status(401).json({ message: 'Unauthorized' });
+			}
 
-			const key = await ApiKeyService.generate(userId, name, expiresInDays);
+			const key = await ApiKeyService.generate(
+				userId,
+				name,
+				expiresInDays,
+				actor,
+				req.ip || 'unknown'
+			);
 
 			res.status(201).json({ key });
 		} catch (error) {
@@ -51,15 +58,16 @@ export class ApiKeyController {
 	}
 
 	public async deleteApiKey(req: Request, res: Response) {
-		if (config.app.isDemo) {
-			return res.status(403).json({ message: req.t('errors.demoMode') });
-		}
 		const { id } = req.params;
 		if (!req.user || !req.user.sub) {
 			return res.status(401).json({ message: 'Unauthorized' });
 		}
 		const userId = req.user.sub;
-		await ApiKeyService.deleteKey(id, userId);
+		const actor = await this.userService.findById(userId);
+		if (!actor) {
+			return res.status(401).json({ message: 'Unauthorized' });
+		}
+		await ApiKeyService.deleteKey(id, userId, actor, req.ip || 'unknown');
 
 		res.status(204).send({ message: req.t('apiKeys.deleteSuccess') });
 	}
