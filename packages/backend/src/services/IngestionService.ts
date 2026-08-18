@@ -9,7 +9,20 @@ import type {
 	PendingEmail,
 	ProcessEmailError,
 } from '@open-archiver/types';
-import { and, count, countDistinct, desc, eq, gte, inArray, max, min, or, sql } from 'drizzle-orm';
+import {
+	and,
+	count,
+	countDistinct,
+	desc,
+	eq,
+	gte,
+	inArray,
+	max,
+	min,
+	or,
+	sql,
+	type SQL,
+} from 'drizzle-orm';
 import { CryptoService } from './CryptoService';
 import { EmailProviderFactory } from './EmailProviderFactory';
 import { ingestionQueue, indexingQueue } from '../jobs/queues';
@@ -19,6 +32,7 @@ import type {
 	IInitialImportJob,
 	EmailObject,
 	ReindexMode,
+	IReindexDispatch,
 	IngestionStats,
 } from '@open-archiver/types';
 import { stripAttachmentsFromEml } from '../helpers/emlUtils';
@@ -36,11 +50,31 @@ import { FilterBuilder } from './FilterBuilder';
 import { AuditService } from './AuditService';
 import { User } from '@open-archiver/types';
 import { checkDeletionEnabled } from '../helpers/deletionGuard';
+import { normalizeEmailAddress } from '../helpers/emailAddress';
+import { isIndexingWorkerAlive } from '../jobs/helpers/workerLiveness';
+import { buildReindexWhere } from '../jobs/helpers/indexBacklog';
 
 /** Placeholder used when an email has no parseable From address. sender_email is NOT NULL,
  * so inserting null (from a missing/unparseable sender, e.g. Exchange "Deleted Items"
  * system messages) would fail with Postgres 23502 and drop the email entirely. */
 const UNKNOWN_SENDER = 'unknown@no-sender.invalid';
+
+/**
+ * The mailbox column reduced to its canonical form.
+ *
+ * Rows archived before addresses were normalized on the way in still hold whatever casing and
+ * padding the provider sent, so the column is reduced the same way the value was. Used for grouping
+ * as well as matching: without it the same mailbox archived under two casings shows up as two rows
+ * in the per-mailbox table and inflates `mailboxCount`.
+ */
+const normalizedMailbox = sql<string>`lower(btrim(${archivedEmails.userEmail}))`;
+
+/**
+ * Matches the mailbox column against an already-normalized address. Without this a provider that
+ * changes the casing of a mailbox between syncs misses every dedup check and archives the whole
+ * mailbox a second time.
+ */
+const matchesMailbox = (normalizedAddress: string) => eq(normalizedMailbox, normalizedAddress);
 
 export class IngestionService {
 	private static auditService = new AuditService();
@@ -153,6 +187,22 @@ export class IngestionService {
 		});
 	}
 
+	/**
+	 * The stored row, without decrypting credentials.
+	 *
+	 * Permission checks only read plain columns (`id`, `userId`, `name`, `provider`, `status`), and
+	 * a source whose credentials fail to decrypt must still be authorized rather than error.
+	 */
+	public static async findRowById(
+		id: string
+	): Promise<typeof ingestionSources.$inferSelect | undefined> {
+		const [source] = await db
+			.select()
+			.from(ingestionSources)
+			.where(eq(ingestionSources.id, id));
+		return source;
+	}
+
 	public static async findById(id: string): Promise<IngestionSource> {
 		const [source] = await db
 			.select()
@@ -235,8 +285,13 @@ export class IngestionService {
 	 * Returns all ingestionSourceId values in a merge group given any member's ID.
 	 * If the source is standalone (no parent, no children), returns just its own ID.
 	 */
-	public static async findGroupSourceIds(sourceId: string): Promise<string[]> {
-		const source = await this.findById(sourceId);
+	public static async findGroupSourceIds(
+		sourceId: string,
+		known?: Pick<IngestionSource, 'id' | 'mergedIntoId'>
+	): Promise<string[]> {
+		// `known` lets a caller that already holds the row skip a second SELECT — and, more to the
+		// point, a second AES decrypt of its credentials, which findById does on every call.
+		const source = known ?? (await this.findById(sourceId));
 		const rootId = source.mergedIntoId ?? source.id;
 
 		const children = await db
@@ -245,6 +300,16 @@ export class IngestionService {
 			.where(eq(ingestionSources.mergedIntoId, rootId));
 
 		return [rootId, ...children.map((c) => c.id)];
+	}
+
+	/**
+	 * Restricts a query to one merge group's archived emails.
+	 *
+	 * `inArray` handles a single-element list perfectly well, so the `length === 1 ? eq : inArray`
+	 * ternary this replaces was branching for no reason — in nine separate copies.
+	 */
+	public static groupScopeFilter(sourceIds: string[]): SQL {
+		return inArray(archivedEmails.ingestionSourceId, sourceIds);
 	}
 
 	/**
@@ -396,11 +461,22 @@ export class IngestionService {
 	 * @param mode 'missing' (default) reindexes only emails not yet in the index;
 	 *   'full' rebuilds every document for the source.
 	 */
-	public static async triggerReindex(id: string, mode: ReindexMode = 'missing'): Promise<void> {
+	public static async triggerReindex(
+		id: string,
+		mode: ReindexMode = 'missing'
+	): Promise<IReindexDispatch> {
 		const source = await this.findById(id);
 		if (!source) {
 			throw new Error('Ingestion source not found');
 		}
+
+		const groupIds = await this.findGroupSourceIds(id, source);
+		const scopeFilter = this.groupScopeFilter(groupIds);
+		const [pending, workerAlive] = await Promise.all([
+			this.countReindexTargets(mode, scopeFilter),
+			isIndexingWorkerAlive(),
+		]);
+
 		// attempts: 1 — the master reindex resets is_indexed=false before dispatching, so an
 		// auto-retry would re-reset rows workers already re-indexed. A failed dispatch is
 		// re-triggerable by hand and the periodic reconcile job backstops any gap. The
@@ -414,15 +490,47 @@ export class IngestionService {
 			},
 			{ attempts: 1 }
 		);
+
+		return { pending, workerAlive };
 	}
 
 	/**
 	 * Enqueues a reindex of the entire archive across all sources.
 	 * @param mode 'missing' (default) or 'full'.
 	 */
-	public static async triggerReindexAll(mode: ReindexMode = 'missing'): Promise<void> {
+	public static async triggerReindexAll(
+		mode: ReindexMode = 'missing'
+	): Promise<IReindexDispatch> {
+		const [pending, workerAlive] = await Promise.all([
+			this.countReindexTargets(mode),
+			isIndexingWorkerAlive(),
+		]);
+
 		// attempts: 1 — see triggerReindex; the destructive is_indexed reset must not auto-retry.
 		await indexingQueue.add('reindex', { scope: 'all', mode }, { attempts: 1 });
+
+		return { pending, workerAlive };
+	}
+
+	/**
+	 * How many emails the dispatched reindex job will hand to the indexer, using the same predicate
+	 * the processor applies: `full` rebuilds everything in scope, `missing` only what the database
+	 * believes is absent from the index.
+	 *
+	 * Counted here rather than reported by the job so the answer can travel back on the HTTP
+	 * response. It is a snapshot — ingestion may add rows between this count and the job running —
+	 * but the distinction that matters to a user, "some" versus "none at all", is exact.
+	 */
+	private static async countReindexTargets(
+		mode: ReindexMode,
+		scopeFilter?: SQL
+	): Promise<number> {
+		const [row] = await db
+			.select({ total: count() })
+			.from(archivedEmails)
+			.where(buildReindexWhere(mode, scopeFilter));
+
+		return row?.total ?? 0;
 	}
 
 	/**
@@ -434,10 +542,7 @@ export class IngestionService {
 		id: string
 	): Promise<{ archivedCount: number; indexedCount: number }> {
 		const groupIds = await this.findGroupSourceIds(id);
-		const sourceFilter =
-			groupIds.length === 1
-				? eq(archivedEmails.ingestionSourceId, groupIds[0])
-				: inArray(archivedEmails.ingestionSourceId, groupIds);
+		const sourceFilter = IngestionService.groupScopeFilter(groupIds);
 
 		// Count archived rows vs. rows the DB knows are indexed in a single scan.
 		// `is_indexed` is set by IndexingService.markIndexed only after Meilisearch
@@ -467,14 +572,8 @@ export class IngestionService {
 		const rootId = source.mergedIntoId ?? source.id;
 		const groupIds = await this.findGroupSourceIds(id);
 
-		const emailFilter =
-			groupIds.length === 1
-				? eq(archivedEmails.ingestionSourceId, groupIds[0])
-				: inArray(archivedEmails.ingestionSourceId, groupIds);
-		const attachmentFilter =
-			groupIds.length === 1
-				? eq(attachmentsSchema.ingestionSourceId, groupIds[0])
-				: inArray(attachmentsSchema.ingestionSourceId, groupIds);
+		const emailFilter = IngestionService.groupScopeFilter(groupIds);
+		const attachmentFilter = inArray(attachmentsSchema.ingestionSourceId, groupIds);
 
 		const thirtyDaysAgo = new Date();
 		thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
@@ -493,7 +592,9 @@ export class IngestionService {
 			db
 				.select({
 					totalEmails: count(),
-					mailboxCount: countDistinct(archivedEmails.userEmail),
+					// Counted on the normalized address so one mailbox archived under two
+					// casings is one mailbox, not two.
+					mailboxCount: countDistinct(normalizedMailbox),
 					threadCount: countDistinct(archivedEmails.threadId),
 					firstEmailAt: min(archivedEmails.sentAt),
 					lastEmailAt: max(archivedEmails.sentAt),
@@ -542,12 +643,12 @@ export class IngestionService {
 			// separately below with hash-dedup so it matches the group `emailBytes` basis.
 			db
 				.select({
-					userEmail: archivedEmails.userEmail,
+					userEmail: normalizedMailbox,
 					emailCount: count(),
 				})
 				.from(archivedEmails)
 				.where(emailFilter)
-				.groupBy(archivedEmails.userEmail)
+				.groupBy(normalizedMailbox)
 				.orderBy(desc(count())),
 			// Per-mailbox physical storage, deduplicated by file hash within each mailbox
 			// (same methodology as the group-level `emailBytes`). A file shared across
@@ -559,8 +660,11 @@ export class IngestionService {
 					userEmail: sql<string>`t.user_email`,
 					bytes: sql<number>`coalesce(sum(t.size_bytes), 0)`.mapWith(Number),
 				})
+				// Normalized to the same expression as the per-mailbox counts above: the two
+				// results are joined on this value in JS, so normalizing only one of them would
+				// make every lookup miss and report zero bytes for each mailbox.
 				.from(
-					sql`(select distinct ${archivedEmails.userEmail} as user_email, ${archivedEmails.storageHashSha256} as hash, ${archivedEmails.sizeBytes} as size_bytes from ${archivedEmails} where ${emailFilter}) as t`
+					sql`(select distinct ${normalizedMailbox} as user_email, ${archivedEmails.storageHashSha256} as hash, ${archivedEmails.sizeBytes} as size_bytes from ${archivedEmails} where ${emailFilter}) as t`
 				)
 				.groupBy(sql`t.user_email`),
 			// Merge-group children metadata.
@@ -731,7 +835,10 @@ export class IngestionService {
 			if (connector.listAllUsers) {
 				// For multi-mailbox providers, dispatch a job for each user
 				for await (const user of connector.listAllUsers()) {
-					const userEmail = user.primaryEmail;
+					// Normalized here so the mailbox identity is canonical before it is queued.
+					const userEmail = user.primaryEmail
+						? normalizeEmailAddress(user.primaryEmail)
+						: '';
 					if (userEmail) {
 						await ingestionQueue.add('process-mailbox', {
 							ingestionSourceId: source.id,
@@ -745,8 +852,8 @@ export class IngestionService {
 					ingestionSourceId: source.id,
 					userEmail:
 						source.credentials.type === 'generic_imap'
-							? source.credentials.username
-							: 'Default',
+							? normalizeEmailAddress(source.credentials.username)
+							: 'default',
 				});
 			}
 		} catch (error) {
@@ -777,20 +884,22 @@ export class IngestionService {
 	 * mailbox already has the email.
 	 */
 	public static async doesEmailExist(
-		messageId: string,
+		rawMessageId: string,
 		ingestionSourceId: string,
-		userEmail: string
+		rawUserEmail: string
 	): Promise<boolean> {
+		// Bounded on the way in so this pre-fetch check compares against the same key processEmail
+		// stored. Without it an over-long id would look absent here and be downloaded again on
+		// every sync.
+		const messageId = IngestionService.boundMessageKey(rawMessageId);
+		const userEmail = normalizeEmailAddress(rawUserEmail);
 		const groupIds = await this.findGroupSourceIds(ingestionSourceId);
-		const sourceFilter =
-			groupIds.length === 1
-				? eq(archivedEmails.ingestionSourceId, groupIds[0])
-				: inArray(archivedEmails.ingestionSourceId, groupIds);
+		const sourceFilter = IngestionService.groupScopeFilter(groupIds);
 
 		const existingEmail = await db.query.archivedEmails.findFirst({
 			where: and(
 				sourceFilter,
-				eq(archivedEmails.userEmail, userEmail),
+				matchesMailbox(userEmail),
 				or(
 					eq(archivedEmails.providerMessageId, messageId),
 					eq(archivedEmails.messageIdHeader, messageId)
@@ -806,9 +915,10 @@ export class IngestionService {
 	 * The provider id / Message-ID becomes an actual filename, but Exchange-style ids can
 	 * exceed the 255-byte filename limit or contain '/', producing ENAMETOOLONG / bad-path
 	 * mkdir errors that drop the email (#405). When the id is unsafe we substitute its
-	 * sha256 hash; the real Message-ID is still preserved in
-	 * archived_emails.message_id_header. Short, safe ids are left as-is so common filenames
-	 * stay human-readable.
+	 * sha256 hash; archived_emails.message_id_header still holds the Message-ID, clamped by
+	 * boundMessageKey only in the pathological case, and the stored .eml always holds the header
+	 * exactly as it arrived. Short, safe ids are left as-is so common filenames stay
+	 * human-readable.
 	 *
 	 * Byte budget: the last folder segment of email.path is glued into the SAME path
 	 * component as this filename (`${sanitizedPath}${fileName}.eml` with no separator), so
@@ -827,6 +937,41 @@ export class IngestionService {
 	/** See buildEmailFileName's byte-budget comment for how these two limits interact. */
 	private static readonly EMAIL_ID_MAX_BYTES = 140;
 	private static readonly PATH_SEGMENT_MAX_BYTES = 100;
+
+	/**
+	 * RFC 5322 caps a header line at 998 octets, so a Message-ID longer than this is already
+	 * malformed. The number that actually matters is the ceiling it stays under: both dedup keys
+	 * sit in a btree (`msgid_header_source_idx`, `provider_msg_source_idx`), and PostgreSQL refuses
+	 * an index tuple over 8191 bytes and a btree tuple over roughly 2704. 998 plus the uuid beside
+	 * it clears both with room to spare.
+	 */
+	private static readonly MESSAGE_KEY_MAX_BYTES = 998;
+
+	/**
+	 * Clamps a value used as a deduplication key — the Message-ID header, or the provider id, which
+	 * for IMAP and the file-based connectors is the Message-ID header again.
+	 *
+	 * A hostile or malformed Message-ID can run to kilobytes. Stored raw it made the whole INSERT
+	 * fail with "index row requires N bytes, maximum size is 8191", so the email was never archived
+	 * and failed identically on every retry (#440). The column itself has no limit; the btree
+	 * indexes over it do.
+	 *
+	 * The sha256 suffix is the part that matters for correctness. Truncating alone would let two
+	 * different messages that share a long prefix collapse into one dedup key, and the second would
+	 * be discarded as a duplicate — a silent loss, which is the one outcome an archive must not
+	 * have. The full header is untouched in the stored .eml either way.
+	 */
+	private static boundMessageKey(value: string): string {
+		if (Buffer.byteLength(value) <= IngestionService.MESSAGE_KEY_MAX_BYTES) {
+			return value;
+		}
+		const digest = createHash('sha256').update(value).digest('hex');
+		const truncated = IngestionService.truncateToBytes(
+			value,
+			IngestionService.MESSAGE_KEY_MAX_BYTES - digest.length - 1
+		);
+		return `${truncated}-${digest}`;
+	}
 
 	/** Byte-truncates a string without splitting a multibyte character. */
 	private static truncateToBytes(value: string, maxBytes: number): string {
@@ -897,9 +1042,12 @@ export class IngestionService {
 		email: EmailObject,
 		source: IngestionSource,
 		storage: StorageService,
-		userEmail: string,
+		rawUserEmail: string,
 		skipTempFileCleanup: boolean = false
 	): Promise<PendingEmail | ProcessEmailError | null> {
+		// Normalized once here so the dedup gates and all three inserts below agree on what
+		// counts as the same mailbox, whatever casing or padding the provider sent.
+		const userEmail = normalizeEmailAddress(rawUserEmail);
 		try {
 			// Read the raw bytes from the temp file written by the connector
 			const rawEmlBuffer = await readFile(email.tempFilePath);
@@ -925,6 +1073,12 @@ export class IngestionService {
 					.update(rawEmlBuffer)
 					.digest('hex')}-${source.id}-${email.id}`;
 			}
+			// Both keys are bounded here, once, so the two dedup gates below and all three inserts
+			// agree on them (#440). The provider id needs it as much as the header does: for IMAP
+			// and the file-based connectors email.id IS the parsed Message-ID, and it lands in a
+			// btree of its own via provider_msg_source_idx.
+			messageId = IngestionService.boundMessageKey(messageId);
+			const providerMessageId = IngestionService.boundMessageKey(email.id);
 			// ── Three-gate deduplication ──────────────────────────────────────
 			// Gate 1: Per-mailbox idempotency — has THIS mailbox already archived
 			//         this email? If so, skip entirely (handles re-sync / retry).
@@ -936,16 +1090,13 @@ export class IngestionService {
 			// ─────────────────────────────────────────────────────────────────
 
 			const groupIds = await IngestionService.findGroupSourceIds(source.id);
-			const groupSourceFilter =
-				groupIds.length === 1
-					? eq(archivedEmails.ingestionSourceId, groupIds[0])
-					: inArray(archivedEmails.ingestionSourceId, groupIds);
+			const groupSourceFilter = IngestionService.groupScopeFilter(groupIds);
 
 			// Gate 1: Per-mailbox duplicate check (idempotency guard for re-sync)
 			const perMailboxDuplicate = await db.query.archivedEmails.findFirst({
 				where: and(
 					eq(archivedEmails.messageIdHeader, messageId),
-					eq(archivedEmails.userEmail, userEmail),
+					matchesMailbox(userEmail),
 					groupSourceFilter
 				),
 				columns: { id: true },
@@ -985,7 +1136,7 @@ export class IngestionService {
 						userEmail,
 						threadId: email.threadId,
 						messageIdHeader: messageId,
-						providerMessageId: email.id,
+						providerMessageId,
 						sentAt: email.receivedAt,
 						subject: email.subject,
 						senderName: email.from[0]?.name,
@@ -1067,7 +1218,7 @@ export class IngestionService {
 				const hashDuplicate = await db.query.archivedEmails.findFirst({
 					where: and(
 						eq(archivedEmails.storageHashSha256, emailHash),
-						eq(archivedEmails.userEmail, userEmail),
+						matchesMailbox(userEmail),
 						eq(archivedEmails.ingestionSourceId, effectiveSource.id)
 					),
 					columns: { id: true },
@@ -1106,7 +1257,7 @@ export class IngestionService {
 						userEmail,
 						threadId: email.threadId,
 						messageIdHeader: messageId,
-						providerMessageId: email.id,
+						providerMessageId,
 						sentAt: email.receivedAt,
 						subject: email.subject,
 						senderName: email.from[0]?.name,
@@ -1144,7 +1295,7 @@ export class IngestionService {
 					userEmail,
 					threadId: email.threadId,
 					messageIdHeader: messageId,
-					providerMessageId: email.id,
+					providerMessageId,
 					sentAt: email.receivedAt,
 					subject: email.subject,
 					senderName: email.from[0]?.name,

@@ -8,6 +8,17 @@ const relationToTableMap: Record<string, string> = {
 	// TBD: Add other relations here as needed
 };
 
+/**
+ * Condition fields holding an email address. Policy values are already trimmed and lowercased by
+ * normalizeEmailConditions, so the column has to be reduced the same way for the comparison to
+ * line up — that lets a policy naming `orders@example.com` match a row stored as
+ * `Orders@Example.com` or ` orders@example.com ` (issue #439).
+ *
+ * There is no index on `user_email` in any form, so this expression costs nothing that the query
+ * was not already paying.
+ */
+const normalizedAddressColumns = new Set(['userEmail']);
+
 function getDrizzleColumn(key: string): SQL {
 	const keyParts = key.split('.');
 	if (keyParts.length > 1) {
@@ -18,7 +29,8 @@ function getDrizzleColumn(key: string): SQL {
 			return sql.raw(`"${tableName}"."${columnName}"`);
 		}
 	}
-	return sql`${sql.identifier(camelToSnakeCase(key))}`;
+	const column = sql`${sql.identifier(camelToSnakeCase(key))}`;
+	return normalizedAddressColumns.has(key) ? sql`lower(btrim(${column}))` : column;
 }
 
 export function mongoToDrizzle(query: Record<string, any>): SQL | undefined {
