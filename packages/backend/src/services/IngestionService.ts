@@ -19,6 +19,7 @@ import {
 	inArray,
 	max,
 	min,
+	notInArray,
 	or,
 	sql,
 	type SQL,
@@ -26,6 +27,8 @@ import {
 import { CryptoService } from './CryptoService';
 import { EmailProviderFactory } from './EmailProviderFactory';
 import { ingestionQueue, indexingQueue } from '../jobs/queues';
+import { continuousSyncJobId, initialImportJobId } from '../jobs/helpers/jobIds';
+import { claimJobId } from '../jobs/helpers/claimJobId';
 import type { JobType } from 'bullmq';
 import { StorageService } from './StorageService';
 import type {
@@ -53,6 +56,7 @@ import { checkDeletionEnabled } from '../helpers/deletionGuard';
 import { normalizeEmailAddress } from '../helpers/emailAddress';
 import { mapWithConcurrency } from '../helpers/mapWithConcurrency';
 import { truncateToBytes } from '../helpers/truncateToBytes';
+import { quoteMeiliString } from '../helpers/meiliFilter';
 import { isIndexingWorkerAlive } from '../jobs/helpers/workerLiveness';
 import { buildReindexWhere } from '../jobs/helpers/indexBacklog';
 
@@ -286,6 +290,80 @@ export class IngestionService {
 		return decryptedSource;
 	}
 
+	/**
+	 * Takes exclusive ownership of a source for one sync cycle, or reports that someone else has it.
+	 *
+	 * Reading the status and then writing it in a second statement is a check-then-act, and two
+	 * `continuous-sync` jobs dispatched in the same tick both read `active` before either writes
+	 * `syncing`. Both then proceeded, each created its own session, and the two sets of
+	 * `process-mailbox` jobs raced the check-then-insert dedup in `processEmail` — which has no
+	 * unique index behind it — and archived the same message twice, milliseconds apart. That is why
+	 * sources of the same mailbox drift apart in email count while all of them report success.
+	 *
+	 * One conditional UPDATE closes it: PostgreSQL serializes the two writers on the row, the second
+	 * sees the already-committed `syncing` and matches nothing. `RETURNING` gives the caller the row
+	 * it just claimed, so nothing has to be re-read.
+	 *
+	 * @returns the claimed source, or null when another cycle already holds it.
+	 */
+	public static async claimForSync(id: string): Promise<IngestionSource | null> {
+		const [claimed] = await db
+			.update(ingestionSources)
+			.set({ status: 'syncing', lastSyncStartedAt: new Date() })
+			.where(
+				and(
+					eq(ingestionSources.id, id),
+					inArray(ingestionSources.status, ['active', 'error'])
+				)
+			)
+			.returning();
+
+		if (!claimed) {
+			return null;
+		}
+
+		const decryptedSource = this.decryptSource(claimed);
+		if (!decryptedSource) {
+			throw new Error('Failed to decrypt ingestion source credentials.');
+		}
+		return decryptedSource;
+	}
+
+	/**
+	 * The initial-import counterpart of {@link claimForSync}.
+	 *
+	 * Excluded rather than included statuses, because an import is legitimate from every state a
+	 * source can reach except one already running — a re-import of a `paused` or `imported` source is
+	 * something the operator asks for explicitly, while `importing` and `syncing` mean a cycle is
+	 * already in flight and a second would duplicate its work.
+	 */
+	public static async claimForImport(id: string): Promise<IngestionSource | null> {
+		const [claimed] = await db
+			.update(ingestionSources)
+			.set({
+				status: 'importing',
+				lastSyncStartedAt: new Date(),
+				lastSyncStatusMessage: 'Starting initial import...',
+			})
+			.where(
+				and(
+					eq(ingestionSources.id, id),
+					notInArray(ingestionSources.status, ['importing', 'syncing'])
+				)
+			)
+			.returning();
+
+		if (!claimed) {
+			return null;
+		}
+
+		const decryptedSource = this.decryptSource(claimed);
+		if (!decryptedSource) {
+			throw new Error('Failed to decrypt ingestion source credentials.');
+		}
+		return decryptedSource;
+	}
+
 	public static async update(
 		id: string,
 		dto: UpdateIngestionSourceDto,
@@ -483,9 +561,19 @@ export class IngestionService {
 		// NOTE: This is done by database CASADE, change when CASADE relation no longer exists.
 		// await db.delete(archivedEmails).where(eq(archivedEmails.ingestionSourceId, id));
 
-		// Delete all documents from Meilisearch
+		// Delete all documents from Meilisearch.
+		//
+		// Waited to completion, and not merely enqueued: the rows below are removed by cascade the
+		// moment this method returns, so a task that fails afterwards leaves documents describing
+		// emails nothing can resolve, and search answers with results that cannot be opened (#446).
+		// Failing here instead keeps the source and lets the caller retry. The id is quoted rather
+		// than interpolated so a value carrying a quote cannot alter the filter.
 		const searchService = new SearchService();
-		await searchService.deleteDocumentsByFilter('emails', `ingestionSourceId = ${id}`);
+		const deletionTask = await searchService.deleteDocumentsByFilter(
+			'emails',
+			`ingestionSourceId = ${quoteMeiliString(id)}`
+		);
+		await searchService.waitForTask(deletionTask.taskUid);
 
 		const [deletedSource] = await db
 			.delete(ingestionSources)
@@ -520,7 +608,25 @@ export class IngestionService {
 	public static async triggerInitialImport(id: string): Promise<void> {
 		const source = await this.findById(id);
 
-		await ingestionQueue.add('initial-import', { ingestionSourceId: source.id });
+		// A fixed job id, so a second import cannot be queued beside a running one, and so the
+		// stale-source rescue can tell an abandoned import from one still enumerating mailboxes.
+		// Claimed rather than merely added: BullMQ drops an add whose id still has a record, and a
+		// completed record is retained, so without clearing it a later re-import would silently do
+		// nothing — the failure mode behind #446.
+		const alreadyRunning = await claimJobId(ingestionQueue, initialImportJobId(source.id));
+		if (alreadyRunning) {
+			logger.info(
+				{ ingestionSourceId: source.id },
+				'Initial import already queued or running - not starting a second one'
+			);
+			return;
+		}
+
+		await ingestionQueue.add(
+			'initial-import',
+			{ ingestionSourceId: source.id },
+			{ jobId: initialImportJobId(source.id) }
+		);
 	}
 
 	/**
@@ -846,7 +952,17 @@ export class IngestionService {
 			},
 		});
 
-		await ingestionQueue.add('continuous-sync', { ingestionSourceId: source.id });
+		// Same per-source job id the scheduler uses, so a force sync pressed while a cycle is already
+		// running joins it instead of starting a competing one.
+		await ingestionQueue.add(
+			'continuous-sync',
+			{ ingestionSourceId: source.id },
+			{
+				jobId: continuousSyncJobId(source.id),
+				removeOnComplete: true,
+				removeOnFail: true,
+			}
+		);
 
 		// If this is a root source, also trigger sync for all non-file-based active/error children
 		if (!source.mergedIntoId) {
@@ -869,7 +985,15 @@ export class IngestionService {
 						{ childId: child.id, parentId: id },
 						'Cascading force sync to child source.'
 					);
-					await ingestionQueue.add('continuous-sync', { ingestionSourceId: child.id });
+					await ingestionQueue.add(
+						'continuous-sync',
+						{ ingestionSourceId: child.id },
+						{
+							jobId: continuousSyncJobId(child.id),
+							removeOnComplete: true,
+							removeOnFail: true,
+						}
+					);
 				}
 			}
 		}
