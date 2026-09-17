@@ -42,6 +42,8 @@ import type {
 	IngestionStats,
 } from '@open-archiver/types';
 import { stripAttachmentsFromEml } from '../helpers/emlUtils';
+import { streamToBuffer } from '../helpers/streamToBuffer';
+import { isStorageObjectExistsError } from './storage/errors';
 import {
 	archivedEmails,
 	attachments as attachmentsSchema,
@@ -1205,6 +1207,114 @@ export class IngestionService {
 		return true;
 	}
 
+	/** Reads the Message-ID out of an .eml's header block, or undefined when it carries none. */
+	private static messageIdOfRawEml(eml: Buffer): string | undefined {
+		// Headers end at the first blank line; 64 KiB is far past any real header block and keeps
+		// a malformed file from being scanned in full.
+		const head = eml.subarray(0, Math.min(eml.length, 64 * 1024)).toString('latin1');
+		const headerBlock = head.split(/\r?\n\r?\n/, 1)[0];
+		// Unfolded: a continuation line starts with whitespace.
+		const match = headerBlock.match(/^message-id:[ \t]*((?:.|\r?\n[ \t])*)$/im);
+		return match ? match[1].replace(/\r?\n[ \t]+/g, ' ').trim() : undefined;
+	}
+
+	/**
+	 * Writes an email's bytes without ever replacing what is already at the path, and reports
+	 * where they ended up together with the hash and size of that object.
+	 *
+	 * The path is derived from `email.id`, so two workers archiving the same message — a journal
+	 * report delivered twice, both copies racing the check-then-insert dedup — target one path.
+	 * An unconditional write let the second silently replace the first's bytes while both rows
+	 * kept the hash of what they had written; every row but the last writer's then failed its
+	 * integrity check against bytes that no longer existed.
+	 *
+	 * A path collision is not proof of the same message, though. `email.id` falls back to the
+	 * IMAP UID when a message has no Message-ID, and a UIDVALIDITY reset reassigns those, so a
+	 * different email can land on a taken path — as can a re-ingest after a purge that left the
+	 * file behind. Adopting blindly there would store one message under a row describing another,
+	 * and the integrity report would call it verified. So adoption requires the stored object to
+	 * carry the same Message-ID; anything else gets its own content-addressed path.
+	 */
+	private async storeEmailOrAdopt(
+		storage: StorageService,
+		emailPath: string,
+		content: Buffer,
+		context: {
+			messageId: string;
+			userEmail: string;
+			ingestionSourceId: string;
+			/** The incoming email's own Message-ID header, when it has one. */
+			messageIdHeader?: string;
+			/** sha256 of `content`, when the caller has already computed it. */
+			knownHash?: string;
+		}
+	): Promise<{ storagePath: string; hash: string; sizeBytes: number }> {
+		const hashOf = (buffer: Buffer): string =>
+			createHash('sha256').update(buffer).digest('hex');
+
+		try {
+			await storage.put(emailPath, content, { overwrite: false });
+			return {
+				storagePath: emailPath,
+				hash: context.knownHash ?? hashOf(content),
+				sizeBytes: content.length,
+			};
+		} catch (error) {
+			if (!isStorageObjectExistsError(error)) {
+				throw error;
+			}
+		}
+
+		// Read through StorageService, so these are the plaintext bytes — the same ones
+		// IntegrityService will hash when it verifies the row.
+		const stored = await streamToBuffer(await storage.get(emailPath));
+		const storedMessageId = IngestionService.messageIdOfRawEml(stored);
+		const incomingMessageId =
+			context.messageIdHeader ?? IngestionService.messageIdOfRawEml(content);
+
+		if (
+			storedMessageId &&
+			incomingMessageId &&
+			storedMessageId.trim() === incomingMessageId.trim()
+		) {
+			logger.warn(
+				{ ...context, storagePath: emailPath, knownHash: undefined },
+				'Archive file already existed at this path for the same message; adopting the stored bytes instead of overwriting them'
+			);
+			return {
+				storagePath: emailPath,
+				hash: hashOf(stored),
+				sizeBytes: stored.length,
+			};
+		}
+
+		// Different message, or one of the two has no Message-ID to compare. Give this content its
+		// own name. The suffix is the content hash, so a genuine retry of this same email lands on
+		// the same path and its EEXIST means byte-identical content — safe to adopt directly.
+		const contentHash = context.knownHash ?? hashOf(content);
+		const disambiguated = `${emailPath.replace(/\.eml$/, '')}-${contentHash.slice(0, 8)}.eml`;
+		logger.warn(
+			{
+				...context,
+				storagePath: emailPath,
+				storedMessageId,
+				incomingMessageId,
+				disambiguatedPath: disambiguated,
+			},
+			'Archive path already held a different message; storing this one under a content-addressed path'
+		);
+
+		try {
+			await storage.put(disambiguated, content, { overwrite: false });
+		} catch (error) {
+			if (!isStorageObjectExistsError(error)) {
+				throw error;
+			}
+			// Same content hash in the name, so the object there is these very bytes.
+		}
+		return { storagePath: disambiguated, hash: contentHash, sizeBytes: content.length };
+	}
+
 	/**
 	 * Builds the filesystem-safe filename component for an email's .eml from its id.
 	 * The provider id / Message-ID becomes an actual filename, but Exchange-style ids can
@@ -1563,7 +1673,13 @@ export class IngestionService {
 						storageHashSha256: existingGroupEmail.storageHashSha256,
 						sizeBytes: existingGroupEmail.sizeBytes,
 						hasAttachments: existingGroupEmail.hasAttachments,
-						isJournaled: effectiveSource.provider === 'smtp_journaling',
+						// The delivering source, NOT effectiveSource. How a message was captured is
+						// a property of the source that brought it in; storage ownership is not.
+						// A journaling child merged into a mailbox root has an effectiveSource of
+						// microsoft_365 or the like, so reading the provider off the root recorded
+						// every journaled message as not journaled — and the integrity report,
+						// which exists to state the capture path, printed the opposite of the truth.
+						isJournaled: source.provider === 'smtp_journaling',
 						path: email.path,
 						tags: email.tags,
 					})
@@ -1655,13 +1771,28 @@ export class IngestionService {
 				});
 
 				let storagePath: string;
+				let storedHash = emailHash;
+				let storedSize = rawEmlBuffer.length;
 				if (hashExistingOther) {
 					// File already on disk — create a reference row
 					storagePath = hashExistingOther.storagePath;
 				} else {
-					// First occurrence — store the unmodified raw buffer
-					storagePath = emailPath;
-					await storage.put(emailPath, rawEmlBuffer);
+					// First occurrence — store the unmodified raw buffer. The hash-level checks
+					// above cannot see a same-Message-ID copy with different bytes (a second
+					// delivery with its own Received headers), so the write itself must refuse to
+					// replace whatever such a copy already put at this path, and reports back
+					// where the bytes actually landed.
+					({
+						storagePath,
+						hash: storedHash,
+						sizeBytes: storedSize,
+					} = await this.storeEmailOrAdopt(storage, emailPath, rawEmlBuffer, {
+						messageId,
+						userEmail,
+						ingestionSourceId: effectiveSource.id,
+						messageIdHeader: IngestionService.messageIdHeaderOf(email),
+						knownHash: emailHash,
+					}));
 				}
 
 				const [archivedEmail] = await db
@@ -1682,10 +1813,11 @@ export class IngestionService {
 							bcc: email.bcc ?? [],
 						},
 						storagePath,
-						storageHashSha256: emailHash,
-						sizeBytes: rawEmlBuffer.length,
+						storageHashSha256: storedHash,
+						sizeBytes: storedSize,
 						hasAttachments: email.attachments.length > 0,
-						isJournaled: effectiveSource.provider === 'smtp_journaling',
+						// Delivering source, not the merge root — see the reference-row insert above.
+						isJournaled: source.provider === 'smtp_journaling',
 						path: email.path,
 						tags: email.tags,
 					})
@@ -1699,8 +1831,16 @@ export class IngestionService {
 			// Default mode: strip non-inline attachments from the .eml to avoid double-storing
 			// attachment data (attachments are stored separately).
 			const emlBuffer = await stripAttachmentsFromEml(rawEmlBuffer);
-			const emailHash = createHash('sha256').update(emlBuffer).digest('hex');
-			await storage.put(emailPath, emlBuffer);
+			const {
+				storagePath: emailStoragePath,
+				hash: emailHash,
+				sizeBytes: emailSize,
+			} = await this.storeEmailOrAdopt(storage, emailPath, emlBuffer, {
+				messageId,
+				userEmail,
+				ingestionSourceId: effectiveSource.id,
+				messageIdHeader: IngestionService.messageIdHeaderOf(email),
+			});
 
 			const [archivedEmail] = await db
 				.insert(archivedEmails)
@@ -1719,11 +1859,12 @@ export class IngestionService {
 						cc: email.cc,
 						bcc: email.bcc ?? [],
 					},
-					storagePath: emailPath,
+					storagePath: emailStoragePath,
 					storageHashSha256: emailHash,
-					sizeBytes: emlBuffer.length,
+					sizeBytes: emailSize,
 					hasAttachments: email.attachments.length > 0,
-					isJournaled: effectiveSource.provider === 'smtp_journaling',
+					// Delivering source, not the merge root — see the reference-row insert above.
+					isJournaled: source.provider === 'smtp_journaling',
 					path: email.path,
 					tags: email.tags,
 				})
